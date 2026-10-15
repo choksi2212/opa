@@ -4960,6 +4960,13 @@ func containsNestedRefOrCall(vis *nestedCheckVisitor, expr *ast.Expr) bool {
 		return containsNestedRefOrCallInBody(vis, o.Lhs) || containsNestedRefOrCallInBody(vis, o.Rhs)
 	}
 
+	// An 'every' expression cannot be trivially negated -- "not every ..." is
+	// not valid Rego -- so a negation holding one is always saved as a support
+	// rule, never inlined.
+	if _, ok := expr.Terms.(*ast.Every); ok {
+		return true
+	}
+
 	return containsNestedRefOrCallInTerm(vis, expr.Terms.(*ast.Term))
 }
 

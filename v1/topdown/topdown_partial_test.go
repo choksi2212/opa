@@ -5592,6 +5592,79 @@ func TestTopDownPartialEvalNegation(t *testing.T) {
 			`},
 		},
 		{
+			note:  "negation: support every over unknown",
+			query: "data.test.allow = true",
+			modules: []string{
+				`package test
+
+				allow if not blocked
+
+				blocked if {
+					every x in input.xs {
+						x == 1
+					}
+				}`,
+			},
+			wantQueries: []string{`not data.partial.__not1_0_2__`},
+			wantSupport: []string{
+				`package partial
+
+				__not1_0_2__ if every __local0__3, __local1__3 in input.xs { __local1__3 = 1 }`,
+			},
+		},
+		{
+			note:  "negation: support every over unknown, conjunction body",
+			query: "data.test.allow = true",
+			modules: []string{
+				`package test
+
+				allow if not blocked
+
+				blocked if {
+					input.y == 1
+					every x in input.xs {
+						x == 1
+					}
+				}`,
+			},
+			wantQueries: []string{`not data.partial.__not1_0_2__`},
+			wantSupport: []string{
+				`package partial
+
+				__not1_0_2__ if {
+					input.y = 1
+					every __local0__3, __local1__3 in input.xs { __local1__3 = 1 }
+				}`,
+			},
+		},
+		{
+			note:  "negation: support every over unknown, disjunctive bodies",
+			query: "data.test.allow = true",
+			modules: []string{
+				`package test
+
+				allow if not blocked
+
+				blocked if {
+					every x in input.xs {
+						x == 1
+					}
+				}
+
+				blocked if {
+					input.y == 2
+				}`,
+			},
+			wantQueries: []string{`not data.partial.__not1_0_2__`},
+			wantSupport: []string{
+				`package partial
+
+				__not1_0_2__ if input.y = 2
+
+				__not1_0_2__ if every __local0__3, __local1__3 in input.xs { __local1__3 = 1 }`,
+			},
+		},
+		{
 			note:  "negation: inline safety with live var",
 			query: "input = x; not data.test.f(x)",
 			modules: []string{
