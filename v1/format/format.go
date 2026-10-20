@@ -1645,6 +1645,60 @@ func isLogicalExpr(expr *ast.Expr) bool {
 	return expr.IsAnd() || expr.IsOr()
 }
 
+// infixPrecedence returns the binding precedence of an infix operator: the
+// higher the value, the tighter it binds to its operands. The levels mirror the
+// term parsing chain in the ast package: `=` and `:=` bind loosest, as their
+// right-hand side is a full term; then `in`; then the relation operators; then
+// `|`, `&`, `+`/`-`, and finally `*`/`/`/`%`.
+func infixPrecedence(bi *ast.Builtin) int {
+	switch bi.Infix {
+	case "=", ":=":
+		return 0
+	case "in":
+		return 1
+	case "==", "!=", "<", "<=", ">", ">=":
+		return 2
+	case "|":
+		return 3
+	case "&":
+		return 4
+	case "+", "-":
+		return 5
+	case "*", "/", "%":
+		return 6
+	}
+	return 7
+}
+
+// infixCallPrecedence returns the infix binding precedence of term t, and
+// whether t is an infix call at all.
+func infixCallPrecedence(t *ast.Term) (int, bool) {
+	call, ok := t.Value.(ast.Call)
+	if !ok {
+		return 0, false
+	}
+	bi, ok := ast.BuiltinMap[call[0].String()]
+	if !ok || bi.Infix == "" {
+		return 0, false
+	}
+	return infixPrecedence(bi), true
+}
+
+// infixOperandNeedsParens reports whether an operand of an infix call with
+// operator parent must be parenthesized to preserve its grouping when the
+// formatted output is re-parsed. Rego's infix operators are left-associative,
+// so an operand that binds looser than its parent needs parens in any
+// position, and an operand of equal precedence needs them on the right-hand
+// side.
+func infixOperandNeedsParens(parent *ast.Builtin, operand *ast.Term, rhs bool) bool {
+	op, ok := infixCallPrecedence(operand)
+	if !ok {
+		return false
+	}
+	pp := infixPrecedence(parent)
+	return op < pp || (rhs && op == pp)
+}
+
 func (w *writer) writeFunctionCall(expr *ast.Expr, comments []*ast.Comment) ([]*ast.Comment, error) {
 
 	terms := expr.Terms.([]*ast.Term)
@@ -1666,24 +1720,24 @@ func (w *writer) writeFunctionCall(expr *ast.Expr, comments []*ast.Comment) ([]*
 	var err error
 	switch numCallArgs {
 	case numDeclArgs: // Print infix where result is unassigned (e.g., x != y)
-		comments, err = w.writeTerm(terms[1], comments)
+		comments, err = w.writeTermOpt(infixOperandNeedsParens(bi, terms[1], false), terms[1], comments)
 		if err != nil {
 			return nil, err
 		}
 		w.write(" " + bi.Infix + " ")
-		return w.writeTerm(terms[2], comments)
+		return w.writeTermOpt(infixOperandNeedsParens(bi, terms[2], true), terms[2], comments)
 	case numDeclArgs + 1: // Print infix where result is assigned (e.g., z = x + y)
 		comments, err = w.writeTerm(terms[3], comments)
 		if err != nil {
 			return nil, err
 		}
 		w.write(" " + ast.Equality.Infix + " ")
-		comments, err = w.writeTerm(terms[1], comments)
+		comments, err = w.writeTermOpt(infixOperandNeedsParens(bi, terms[1], false), terms[1], comments)
 		if err != nil {
 			return nil, err
 		}
 		w.write(" " + bi.Infix + " ")
-		comments, err = w.writeTerm(terms[2], comments)
+		comments, err = w.writeTermOpt(infixOperandNeedsParens(bi, terms[2], true), terms[2], comments)
 		if err != nil {
 			return nil, err
 		}
@@ -1755,8 +1809,17 @@ func saveComments(comments []*ast.Comment) *[]*ast.Comment {
 }
 
 func (w *writer) writeTerm(term *ast.Term, comments []*ast.Comment) ([]*ast.Comment, error) {
+	return w.writeTermOpt(false, term, comments)
+}
+
+// writeTermOpt writes term like writeTerm, but lets the caller request that a
+// call term be parenthesized, e.g. because dropping the parens would change
+// how the term parses. When formatting fails on a comment, both variants fall
+// back to emitting the original source text, which preserves any parentheses
+// the author wrote.
+func (w *writer) writeTermOpt(parens bool, term *ast.Term, comments []*ast.Comment) ([]*ast.Comment, error) {
 	if len(comments) == 0 {
-		return w.writeTermParens(false, term, comments)
+		return w.writeTermParens(parens, term, comments)
 	}
 
 	currentLen := w.buf.Len()
@@ -1764,7 +1827,7 @@ func (w *writer) writeTerm(term *ast.Term, comments []*ast.Comment) ([]*ast.Comm
 	currentComments := saveComments(comments)
 	defer commentsSlicePool.Put(currentComments)
 
-	comments, err := w.writeTermParens(false, term, comments)
+	comments, err := w.writeTermParens(parens, term, comments)
 	if err != nil {
 		if isUnexpectedCommentError(err) {
 			w.buf.Truncate(currentLen)
@@ -2089,8 +2152,11 @@ func (w *writer) writeCall(parens bool, x ast.Call, loc *ast.Location, comments 
 
 	if bi.Infix == "in" {
 		// NOTE(sr): `in` requires special handling, mirroring what happens in the parser,
-		// since there can be one or two lhs arguments.
-		return w.writeInOperator(true, x[1:], comments, loc, bi.Decl)
+		// since there can be one or two lhs arguments. The two-lhs (key, value) form is
+		// only parseable inside parentheses, so it is always parenthesized when it
+		// appears as a call operand.
+		parens = parens || len(x) == 4
+		return w.writeInOperator(parens, x[1:], comments, loc, bi.Decl)
 	}
 
 	// TODO(tsandall): improve to consider precedence?
@@ -2138,6 +2204,10 @@ func (w *writer) writeInOperator(parens bool, operands []*ast.Term, comments []*
 	var err error
 	switch len(operands) {
 	case 2:
+		if parens {
+			w.write("(")
+			defer w.write(")")
+		}
 		comments, err = w.writeTermParens(true, operands[0], comments)
 		if err != nil {
 			return nil, err
